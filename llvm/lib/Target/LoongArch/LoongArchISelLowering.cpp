@@ -526,6 +526,8 @@ LoongArchTargetLowering::LoongArchTargetLowering(const TargetMachine &TM,
     setTargetDAGCombine(ISD::UINT_TO_FP);
     setTargetDAGCombine(ISD::ZERO_EXTEND);
     setTargetDAGCombine(ISD::SIGN_EXTEND);
+    setTargetDAGCombine(ISD::VECTOR_SHUFFLE);
+    setTargetDAGCombine(ISD::EXTRACT_SUBVECTOR);
   }
 
   // Set DAG combine for 'LASX' feature.
@@ -6212,10 +6214,17 @@ performHorizWideningCombine(SDNode *N, SelectionDAG &DAG,
   return DAG.getNode(TargetOpc, DL, VT, LHSVec, RHSVec);
 }
 
+static SDValue performWidenAddSubCombine(SDNode *N, SelectionDAG &DAG,
+                                         TargetLowering::DAGCombinerInfo &DCI,
+                                         const LoongArchSubtarget &Subtarget);
+
 static SDValue performADDCombine(SDNode *N, SelectionDAG &DAG,
                                  TargetLowering::DAGCombinerInfo &DCI,
                                  const LoongArchSubtarget &Subtarget) {
   if (SDValue V = performHorizWideningCombine(N, DAG, Subtarget))
+    return V;
+
+  if (SDValue V = performWidenAddSubCombine(N, DAG, DCI, Subtarget))
     return V;
 
   if (DCI.isBeforeLegalizeOps())
@@ -6595,6 +6604,9 @@ static SDValue performSUBCombine(SDNode *N, SelectionDAG &DAG,
                                  TargetLowering::DAGCombinerInfo &DCI,
                                  const LoongArchSubtarget &Subtarget) {
   if (SDValue V = performHorizWideningCombine(N, DAG, Subtarget))
+    return V;
+
+  if (SDValue V = performWidenAddSubCombine(N, DAG, DCI, Subtarget))
     return V;
 
   return SDValue();
@@ -8680,6 +8692,202 @@ static SDValue performVSELECTCombine(SDNode *N, SelectionDAG &DAG,
                      DL, VT, X, Shift);
 }
 
+/// Match the widening even/odd element add/sub patterns and lower them to the
+/// VADDWEV/VADDWOD/VSUBWEV/VSUBWOD instructions (or their unsigned variants).
+///
+/// The pattern is:
+///
+///   (extract_subvector
+///       (add (sext (shuffle a, a, <0, 2, 4, ...>)),
+///            (sext (shuffle b, b, <0, 2, 4, ...>))), 0)
+///
+/// where the shuffles select the even (or odd) elements of their sources and
+/// the add/sub operates on elements widened to twice their size, returning the
+/// low half of the result. The widened add/sub type (e.g. v16i16 on LSX) is
+/// illegal and would be scalarized by type legalization, so the match must run
+/// before it.
+static SDValue performWidenAddSubCombine(SDNode *N, SelectionDAG &DAG,
+                                         TargetLowering::DAGCombinerInfo &DCI,
+                                         const LoongArchSubtarget &Subtarget) {
+  if (!DCI.isBeforeLegalize())
+    return SDValue();
+
+  EVT ResVT = N->getValueType(0);
+  if (!ResVT.isSimple() || !ResVT.isVector())
+    return SDValue();
+
+  // Collect the wide add/sub and its two operands. The generic combiner may
+  // have already split
+  //   extract_subvector(add v16i16, 0)
+  // into a narrow add of two extract_subvectors (narrowExtractedVectorBinOp),
+  // in which case we see the add/sub itself and each operand carries an
+  // extract_subvector wrapper. Otherwise we see the extraction node.
+  unsigned WideOp;
+  SDValue WideOperand0, WideOperand1;
+  if (N->getOpcode() == ISD::ADD || N->getOpcode() == ISD::SUB) {
+    WideOp = N->getOpcode();
+    WideOperand0 = N->getOperand(0);
+    WideOperand1 = N->getOperand(1);
+  } else {
+    SDValue Wide;
+    if (N->getOpcode() == ISD::EXTRACT_SUBVECTOR) {
+      auto *Idx = dyn_cast<ConstantSDNode>(N->getOperand(1));
+      if (!Idx || Idx->getZExtValue() != 0)
+        return SDValue();
+      Wide = N->getOperand(0);
+    } else if (N->getOpcode() == ISD::VECTOR_SHUFFLE) {
+      // Low-half extract may also appear as shuffle(s, s, [0, 1, ..., N-1]) or
+      // shuffle(s, undef, [0, 1, ..., N-1]).
+      bool UndefSecond = N->getOperand(1).isUndef();
+      if (N->getOperand(0) != N->getOperand(1) && !UndefSecond)
+        return SDValue();
+      auto *SVN = cast<ShuffleVectorSDNode>(N);
+      ArrayRef<int> Mask = SVN->getMask();
+      for (unsigned I = 0; I != Mask.size(); ++I)
+        if (Mask[I] != (int)I)
+          return SDValue();
+      Wide = N->getOperand(0);
+      // The shuffle may sit on top of extract_subvector(add, 0).
+      if (Wide.getOpcode() == ISD::EXTRACT_SUBVECTOR) {
+        auto *Idx = dyn_cast<ConstantSDNode>(Wide.getOperand(1));
+        if (!Idx || Idx->getZExtValue() != 0)
+          return SDValue();
+        Wide = Wide.getOperand(0);
+      }
+    } else {
+      return SDValue();
+    }
+    WideOp = Wide.getOpcode();
+    if (WideOp != ISD::ADD && WideOp != ISD::SUB)
+      return SDValue();
+    WideOperand0 = Wide.getOperand(0);
+    WideOperand1 = Wide.getOperand(1);
+  }
+
+  // Match one widening even/odd element operand. Reports the extension opcode
+  // (SIGN_EXTEND or ZERO_EXTEND), the widened vector type, and whether the
+  // shuffle selects odd elements.
+  auto matchOperand = [&](SDValue Op, SDValue &Src, unsigned &ExtOp, bool &Odd,
+                          EVT &WideVT) -> bool {
+    // Unwrap the extract_subvector(..., 0) introduced by the generic combiner
+    // when it split the wide add/sub.
+    if (Op.getOpcode() == ISD::EXTRACT_SUBVECTOR) {
+      auto *Idx = dyn_cast<ConstantSDNode>(Op.getOperand(1));
+      if (!Idx || Idx->getZExtValue() != 0)
+        return false;
+      Op = Op.getOperand(0);
+    }
+    ExtOp = Op.getOpcode();
+    if (ExtOp != ISD::SIGN_EXTEND && ExtOp != ISD::ZERO_EXTEND)
+      return false;
+    WideVT = Op.getValueType();
+    SDValue Shuf = Op.getOperand(0);
+
+    // The even/odd source is usually expressed as a shuffle that keeps the
+    // source width, and those survive into the DAG as VECTOR_SHUFFLE nodes. A
+    // narrowing deinterleave such as <32 x i8> -> <16 x i8> on LASX, however,
+    // is unrolled by the generic vector builder into a BUILD_VECTOR of element
+    // extracts, so match that form as well.
+    if (Shuf.getOpcode() == ISD::VECTOR_SHUFFLE) {
+      // The shuffle references the same vector twice, either as
+      // shuffle(x, x, mask) or the canonicalized shuffle(x, undef, mask').
+      bool SameOperands = Shuf.getOperand(0) == Shuf.getOperand(1);
+      bool UndefSecond = Shuf.getOperand(1).isUndef();
+      if (!SameOperands && !UndefSecond)
+        return false;
+      auto *SVN = cast<ShuffleVectorSDNode>(Shuf);
+      ArrayRef<int> Mask = SVN->getMask();
+      unsigned NumElts = Shuf.getValueType().getVectorNumElements();
+      if (Mask.size() != NumElts)
+        return false;
+      // The parity is fixed by the first selected element: even masks select
+      // 0, 2, 4, ... and odd masks 1, 3, 5, ...
+      Odd = (Mask[0] & 1) != 0;
+      for (unsigned I = 0; I != NumElts; ++I) {
+        int M = Mask[I];
+        int EvenIdx = 2 * (int)I + (Odd ? 1 : 0);
+        // Either the direct index (shuffle(x, x, mask)) or its wrap around
+        // into the first operand once the second one has been dropped as
+        // undef.
+        if (M != EvenIdx && M != EvenIdx - (int)NumElts)
+          return false;
+        if (UndefSecond && M >= (int)NumElts)
+          return false;
+      }
+      Src = Shuf.getOperand(0);
+    } else if (Shuf.getOpcode() == ISD::BUILD_VECTOR) {
+      // BUILD_VECTOR of extract_vector_elt(x, 2*I + parity) is the unrolled
+      // form of the same even/odd deinterleave; all extracts must come from
+      // the same source vector.
+      unsigned NumElts = Shuf.getNumOperands();
+      for (unsigned I = 0; I != NumElts; ++I) {
+        SDValue E = Shuf.getOperand(I);
+        if (E.getOpcode() != ISD::EXTRACT_VECTOR_ELT)
+          return false;
+        auto *Idx = dyn_cast<ConstantSDNode>(E.getOperand(1));
+        if (!Idx)
+          return false;
+        if (I == 0) {
+          Odd = (Idx->getZExtValue() & 1) != 0;
+          Src = E.getOperand(0);
+        } else if (E.getOperand(0) != Src) {
+          return false;
+        }
+        if (Idx->getZExtValue() != 2 * I + (Odd ? 1 : 0))
+          return false;
+      }
+    } else {
+      return false;
+    }
+    return true;
+  };
+
+  SDValue A, B;
+  unsigned ExtA, ExtB;
+  bool OddA, OddB;
+  EVT WideVT;
+  if (!matchOperand(WideOperand0, A, ExtA, OddA, WideVT) ||
+      !matchOperand(WideOperand1, B, ExtB, OddB, WideVT))
+    return SDValue();
+
+  // The node we produce must match one of the VADDWEV/VADDWOD instruction
+  // patterns: the add/sub must actually widen (its element type is the result
+  // element type), and the source vectors -- the shuffle inputs -- carry
+  // elements of half the result width with twice as many lanes, since the
+  // even/odd selection consumes every other lane. On LSX the wide add/sub type
+  // is illegal, so the generic combiner has already split it in two and it has
+  // twice as many lanes as the result; on LASX the wide type is legal and
+  // equals the result type.
+  if (WideVT.getScalarType() != ResVT.getScalarType())
+    return SDValue();
+  EVT SrcVT = A.getValueType();
+  if (SrcVT != B.getValueType())
+    return SDValue();
+  if (SrcVT.getScalarType().getSizeInBits() * 2 !=
+      ResVT.getScalarType().getSizeInBits())
+    return SDValue();
+  if (SrcVT.getVectorNumElements() != ResVT.getVectorNumElements() * 2)
+    return SDValue();
+
+  // Both inputs must use the same extension and the same parity (signed+signed
+  // or unsigned+unsigned, even+even or odd+odd); the mixed forms need separate
+  // handling.
+  if (ExtA != ExtB || OddA != OddB)
+    return SDValue();
+
+  bool IsUnsigned = ExtA == ISD::ZERO_EXTEND;
+  unsigned Op;
+  if (WideOp == ISD::ADD)
+    Op = OddA ? (IsUnsigned ? LoongArchISD::VADDWOD_U : LoongArchISD::VADDWOD)
+              : (IsUnsigned ? LoongArchISD::VADDWEV_U : LoongArchISD::VADDWEV);
+  else
+    Op = OddA ? (IsUnsigned ? LoongArchISD::VSUBWOD_U : LoongArchISD::VSUBWOD)
+              : (IsUnsigned ? LoongArchISD::VSUBWEV_U : LoongArchISD::VSUBWEV);
+
+  SDLoc DL(N);
+  return DAG.getNode(Op, DL, ResVT, A, B);
+}
+
 SDValue LoongArchTargetLowering::PerformDAGCombine(SDNode *N,
                                                    DAGCombinerInfo &DCI) const {
   SelectionDAG &DAG = DCI.DAG;
@@ -8745,6 +8953,10 @@ SDValue LoongArchTargetLowering::PerformDAGCombine(SDNode *N,
     if (SDValue Result =
             combineFP_ROUND(SDValue(N, 0), SDLoc(N), DAG, Subtarget))
       return Result;
+    break;
+  case ISD::VECTOR_SHUFFLE:
+  case ISD::EXTRACT_SUBVECTOR:
+    return performWidenAddSubCombine(N, DAG, DCI, Subtarget);
   }
   return SDValue();
 }

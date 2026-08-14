@@ -21,6 +21,10 @@ def SDT_LoongArchVShuf : SDTypeProfile<1, 3, [SDTCisVec<0>,
                                        SDTCisSameAs<2, 3>]>;
 def SDT_LoongArchV2R : SDTypeProfile<1, 2, [SDTCisVec<0>,
                                      SDTCisSameAs<0, 1>, SDTCisSameAs<1, 2>]>;
+// Widening VADDWEV/VADDWOD: result type is twice the element width of the
+// inputs (e.g. v8i16 = VADDWEV(v16i8, v16i8)).
+def SDT_LoongArchWidenV2R : SDTypeProfile<1, 2, [SDTCisVec<0>, SDTCisVec<1>,
+                                                  SDTCisVec<2>]>;
 def SDT_LoongArchV1RUimm: SDTypeProfile<1, 2, [SDTCisVec<0>,
                                         SDTCisSameAs<0,1>, SDTCisVT<2, GRLenVT>]>;
 def SDT_LoongArchV2RUimm
@@ -107,6 +111,17 @@ def loongarch_vhsubw_u : SDNode<"LoongArchISD::VHSUBW_U", SDT_LoongArchVHW>;
 // Vector Extend with Widening
 def loongarch_vexth : SDNode<"LoongArchISD::VEXTH", SDT_LoongArchVEW>;
 def loongarch_vexth_u : SDNode<"LoongArchISD::VEXTH_U", SDT_LoongArchVEW>;
+
+// Widening even/odd element additions/subtractions (VADDWEV/VADDWOD/VSUBWEV/
+// VSUBWOD). The _u variants select the unsigned instructions.
+def loongarch_vaddwev : SDNode<"LoongArchISD::VADDWEV", SDT_LoongArchWidenV2R>;
+def loongarch_vaddwod : SDNode<"LoongArchISD::VADDWOD", SDT_LoongArchWidenV2R>;
+def loongarch_vsubwev : SDNode<"LoongArchISD::VSUBWEV", SDT_LoongArchWidenV2R>;
+def loongarch_vsubwod : SDNode<"LoongArchISD::VSUBWOD", SDT_LoongArchWidenV2R>;
+def loongarch_vaddwev_u : SDNode<"LoongArchISD::VADDWEV_U", SDT_LoongArchWidenV2R>;
+def loongarch_vaddwod_u : SDNode<"LoongArchISD::VADDWOD_U", SDT_LoongArchWidenV2R>;
+def loongarch_vsubwev_u : SDNode<"LoongArchISD::VSUBWEV_U", SDT_LoongArchWidenV2R>;
+def loongarch_vsubwod_u : SDNode<"LoongArchISD::VSUBWOD_U", SDT_LoongArchWidenV2R>;
 
 // Scalar load broadcast to vector
 def loongarch_vldrepl
@@ -1504,6 +1519,17 @@ multiclass PatVrVrWU<SDPatternOperator OpNode, string Inst> {
             (!cast<LAInst>(Inst#"_QU_DU") LSX128:$vj, LSX128:$vk)>;
 }
 
+multiclass PatVrVrWAddSubU<SDPatternOperator OpNode, string Inst> {
+  def : Pat<(v8i16 (OpNode(v16i8 LSX128:$vj), (v16i8 LSX128:$vk))),
+            (!cast<LAInst>(Inst#"_H_BU") LSX128:$vj, LSX128:$vk)>;
+  def : Pat<(v4i32 (OpNode(v8i16 LSX128:$vj), (v8i16 LSX128:$vk))),
+            (!cast<LAInst>(Inst#"_W_HU") LSX128:$vj, LSX128:$vk)>;
+  def : Pat<(v2i64 (OpNode(v4i32 LSX128:$vj), (v4i32 LSX128:$vk))),
+            (!cast<LAInst>(Inst#"_D_WU") LSX128:$vj, LSX128:$vk)>;
+  def : Pat<(v2i64 (OpNode(v2i64 LSX128:$vj), (v2i64 LSX128:$vk))),
+            (!cast<LAInst>(Inst#"_Q_DU") LSX128:$vj, LSX128:$vk)>;
+}
+
 multiclass PatVrUimmW<SDPatternOperator OpNode, string Inst> {
   def : Pat<(v8i16 (OpNode(v16i8 LSX128:$vj), uimm3:$imm)),
             (!cast<LAInst>(Inst#"_H_B") LSX128:$vj, uimm3:$imm)>;
@@ -1971,6 +1997,23 @@ defm : PatVrVrW<loongarch_vhsubw, "VHSUBW">;
 
 // VHSUBW_{HU_BU/WU_HU/DU_WU/QU_DU}
 defm : PatVrVrWU<loongarch_vhsubw_u, "VHSUBW">;
+
+// VADDWEV_{H_B/W_H/D_W/Q_D}
+defm : PatVrVrW<loongarch_vaddwev, "VADDWEV">;
+// VADDWOD_{H_B/W_H/D_W/Q_D}
+defm : PatVrVrW<loongarch_vaddwod, "VADDWOD">;
+// VSUBWEV_{H_B/W_H/D_W/Q_D}
+defm : PatVrVrW<loongarch_vsubwev, "VSUBWEV">;
+// VSUBWOD_{H_B/W_H/D_W/Q_D}
+defm : PatVrVrW<loongarch_vsubwod, "VSUBWOD">;
+// VADDWEV_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatVrVrWAddSubU<loongarch_vaddwev_u, "VADDWEV">;
+// VADDWOD_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatVrVrWAddSubU<loongarch_vaddwod_u, "VADDWOD">;
+// VSUBWEV_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatVrVrWAddSubU<loongarch_vsubwev_u, "VSUBWEV">;
+// VSUBWOD_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatVrVrWAddSubU<loongarch_vsubwod_u, "VSUBWOD">;
 
 // VFADD_{S/D}
 defm : PatVrVrF<fadd, "VFADD">;

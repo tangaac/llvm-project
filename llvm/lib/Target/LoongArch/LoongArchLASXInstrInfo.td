@@ -1252,6 +1252,17 @@ multiclass PatXrXrWU<SDPatternOperator OpNode, string Inst> {
             (!cast<LAInst>(Inst#"_QU_DU") LASX256:$vj, LASX256:$vk)>;
 }
 
+multiclass PatXrXrWAddSubU<SDPatternOperator OpNode, string Inst> {
+  def : Pat<(v16i16 (OpNode(v32i8 LASX256:$vj), (v32i8 LASX256:$vk))),
+            (!cast<LAInst>(Inst#"_H_BU") LASX256:$vj, LASX256:$vk)>;
+  def : Pat<(v8i32 (OpNode(v16i16 LASX256:$vj), (v16i16 LASX256:$vk))),
+            (!cast<LAInst>(Inst#"_W_HU") LASX256:$vj, LASX256:$vk)>;
+  def : Pat<(v4i64 (OpNode(v8i32 LASX256:$vj), (v8i32 LASX256:$vk))),
+            (!cast<LAInst>(Inst#"_D_WU") LASX256:$vj, LASX256:$vk)>;
+  def : Pat<(v4i64 (OpNode(v4i64 LASX256:$vj), (v4i64 LASX256:$vk))),
+            (!cast<LAInst>(Inst#"_Q_DU") LASX256:$vj, LASX256:$vk)>;
+}
+
 multiclass PatXrUimmW<SDPatternOperator OpNode, string Inst> {
   def : Pat<(v16i16 (OpNode(v32i8 LASX256:$vj), uimm3:$imm)),
             (!cast<LAInst>(Inst#"_H_B") LASX256:$vj, uimm3:$imm)>;
@@ -1701,6 +1712,23 @@ defm : PatXrXrW<loongarch_vhsubw, "XVHSUBW">;
 
 // XVHSUBW_{HU_BU/WU_HU/DU_WU/QU_DU}
 defm : PatXrXrWU<loongarch_vhsubw_u, "XVHSUBW">;
+
+// XVADDWEV_{H_B/W_H/D_W/Q_D}
+defm : PatXrXrW<loongarch_vaddwev, "XVADDWEV">;
+// XVADDWOD_{H_B/W_H/D_W/Q_D}
+defm : PatXrXrW<loongarch_vaddwod, "XVADDWOD">;
+// XVSUBWEV_{H_B/W_H/D_W/Q_D}
+defm : PatXrXrW<loongarch_vsubwev, "XVSUBWEV">;
+// XVSUBWOD_{H_B/W_H/D_W/Q_D}
+defm : PatXrXrW<loongarch_vsubwod, "XVSUBWOD">;
+// XVADDWEV_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatXrXrWAddSubU<loongarch_vaddwev_u, "XVADDWEV">;
+// XVADDWOD_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatXrXrWAddSubU<loongarch_vaddwod_u, "XVADDWOD">;
+// XVSUBWEV_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatXrXrWAddSubU<loongarch_vsubwev_u, "XVSUBWEV">;
+// XVSUBWOD_{H_BU/W_HU/D_WU/Q_DU}
+defm : PatXrXrWAddSubU<loongarch_vsubwod_u, "XVSUBWOD">;
 
 // XVFADD_{S/D}
 defm : PatXrXrF<fadd, "XVFADD">;
