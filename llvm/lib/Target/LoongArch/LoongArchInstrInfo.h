@@ -16,6 +16,8 @@
 #include "LoongArchRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 
+#include <optional>
+
 #define GET_INSTRINFO_HEADER
 #include "LoongArchGenInstrInfo.inc"
 
@@ -108,6 +110,13 @@ public:
 
   std::pair<unsigned, unsigned>
   decomposeMachineOperandsTargetFlags(unsigned TF) const override;
+
+  bool isAssociativeAndCommutative(const MachineInstr &Inst,
+                                   bool Invert = false) const override;
+
+  bool useMachineCombiner() const override { return true; }
+
+  std::optional<unsigned> getInverseOpcode(unsigned Opcode) const override;
 
   ArrayRef<std::pair<unsigned, const char *>>
   getSerializableDirectMachineOperandTargetFlags() const override;
