@@ -2500,6 +2500,35 @@ def PROBED_STACKALLOC_DYN : Pseudo<(outs),
                                    Sched<[]>;
 }
 
+// Masked load/store pseudos: lowered by EmitInstrWithCustomInserter into a
+// page-safety check followed by a full-width vector load/store + blend
+// (fast path), with a per-lane predicated sequence as the cold path.
+// The $fast operand tells the expander whether the fast path is valid
+// (plain full-width masked ops only; extending/indexed/volatile shapes
+// always take the per-lane path).
+let usesCustomInserter = 1, hasSideEffects = 0, isCodeGenOnly = 1 in {
+let mayLoad = 1, mayStore = 0 in {
+  def PseudoMaskedLoadV : Pseudo<(outs LSX128:$dst),
+      (ins LSX128:$mask, GPR:$addr, LSX128:$passthru, i32imm:$fast,
+       i32imm:$memeleltbytes, i32imm:$vtelemtbytes, i32imm:$extkind),
+      [], "masked-load.v">;
+  def PseudoMaskedLoadXV : Pseudo<(outs LASX256:$dst),
+      (ins LASX256:$mask, GPR:$addr, LASX256:$passthru, i32imm:$fast,
+       i32imm:$memeleltbytes, i32imm:$vtelemtbytes, i32imm:$extkind),
+      [], "masked-load.xv">;
+}
+let mayLoad = 0, mayStore = 1 in {
+  def PseudoMaskedStoreV : Pseudo<(outs),
+      (ins LSX128:$data, LSX128:$mask, GPR:$addr, i32imm:$fast,
+       i32imm:$memeleltbytes, i32imm:$vtelemtbytes, i32imm:$extkind),
+      [], "masked-store.v">;
+  def PseudoMaskedStoreXV : Pseudo<(outs),
+      (ins LASX256:$data, LASX256:$mask, GPR:$addr, i32imm:$fast,
+       i32imm:$memeleltbytes, i32imm:$vtelemtbytes, i32imm:$extkind),
+      [], "masked-store.xv">;
+}
+} // usesCustomInserter, hasSideEffects, isCodeGenOnly
+
 //===----------------------------------------------------------------------===//
 // Assembler Pseudo Instructions
 //===----------------------------------------------------------------------===//

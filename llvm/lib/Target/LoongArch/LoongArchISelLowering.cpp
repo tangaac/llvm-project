@@ -545,6 +545,17 @@ LoongArchTargetLowering::LoongArchTargetLowering(const TargetMachine &TM,
     setTargetDAGCombine(ISD::CONCAT_VECTORS);
   }
 
+  // Masked load/store are lowered via pseudo instructions: a page-safety
+  // check guards a full-width vector load/store + bitsel blend (fast
+  // path); otherwise a per-lane predicated sequence is emitted (cold
+  // path). See emitMaskedLoadPseudo/emitMaskedStorePseudo.
+  if (Subtarget.hasExtLSX())
+    for (MVT VT : LSXVTs)
+      setOperationAction({ISD::MLOAD, ISD::MSTORE}, VT, Custom);
+  if (Subtarget.hasExtLASX())
+    for (MVT VT : LASXVTs)
+      setOperationAction({ISD::MLOAD, ISD::MSTORE}, VT, Custom);
+
   // Compute derived properties from the register classes.
   computeRegisterProperties(Subtarget.getRegisterInfo());
 
@@ -665,6 +676,10 @@ SDValue LoongArchTargetLowering::LowerOperation(SDValue Op,
     return lowerFP_TO_BF16(Op, DAG);
   case ISD::BF16_TO_FP:
     return lowerBF16_TO_FP(Op, DAG);
+  case ISD::MLOAD:
+    return lowerMLOAD(Op, DAG);
+  case ISD::MSTORE:
+    return lowerMSTORE(Op, DAG);
   case ISD::VECREDUCE_ADD:
     return lowerVECREDUCE_ADD(Op, DAG);
   case ISD::ROTL:
@@ -9144,45 +9159,39 @@ emitVecCondBranchPseudo(MachineInstr &MI, MachineBasicBlock *BB,
   return SinkBB;
 }
 
-static MachineBasicBlock *
-emitPseudoXVINSGR2VR(MachineInstr &MI, MachineBasicBlock *BB,
-                     const LoongArchSubtarget &Subtarget) {
+// Insert a GPR scalar into one lane of a 256-bit vector.  LASX has no
+// real XVINSGR2VR_B/H instructions (only Pseudo variants expanded by
+// SelectionDAG's custom inserter, unreachable from hand-built MIR), so
+// the expansion lives here for reuse.  Writes the inserted value to Dst.
+static void emitXVByteHalfInsert(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator It,
+                                 const DebugLoc &DL, const TargetInstrInfo *TII,
+                                 MachineRegisterInfo &MRI, Register XSrc,
+                                 Register Elt, unsigned Idx,
+                                 unsigned VTEltBytes, Register Dst) {
   unsigned InsOp;
   unsigned BroadcastOp;
   unsigned HalfSize;
-  switch (MI.getOpcode()) {
-  default:
-    llvm_unreachable("Unexpected opcode");
-  case LoongArch::PseudoXVINSGR2VR_B:
+  if (VTEltBytes == 1) {
     HalfSize = 16;
     BroadcastOp = LoongArch::XVREPLGR2VR_B;
     InsOp = LoongArch::XVEXTRINS_B;
-    break;
-  case LoongArch::PseudoXVINSGR2VR_H:
+  } else {
     HalfSize = 8;
     BroadcastOp = LoongArch::XVREPLGR2VR_H;
     InsOp = LoongArch::XVEXTRINS_H;
-    break;
   }
-  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
   const TargetRegisterClass *RC = &LoongArch::LASX256RegClass;
   const TargetRegisterClass *SubRC = &LoongArch::LSX128RegClass;
-  DebugLoc DL = MI.getDebugLoc();
-  MachineRegisterInfo &MRI = BB->getParent()->getRegInfo();
-  // XDst = vector_insert XSrc, Elt, Idx
-  Register XDst = MI.getOperand(0).getReg();
-  Register XSrc = MI.getOperand(1).getReg();
-  Register Elt = MI.getOperand(2).getReg();
-  unsigned Idx = MI.getOperand(3).getImm();
 
   if (XSrc.isVirtual() && MRI.getVRegDef(XSrc)->isImplicitDef() &&
       Idx < HalfSize) {
     Register ScratchSubReg1 = MRI.createVirtualRegister(SubRC);
     Register ScratchSubReg2 = MRI.createVirtualRegister(SubRC);
 
-    BuildMI(*BB, MI, DL, TII->get(LoongArch::COPY), ScratchSubReg1)
+    BuildMI(MBB, It, DL, TII->get(LoongArch::COPY), ScratchSubReg1)
         .addReg(XSrc, {}, LoongArch::sub_128);
-    BuildMI(*BB, MI, DL,
+    BuildMI(MBB, It, DL,
             TII->get(HalfSize == 8 ? LoongArch::VINSGR2VR_H
                                    : LoongArch::VINSGR2VR_B),
             ScratchSubReg2)
@@ -9190,25 +9199,40 @@ emitPseudoXVINSGR2VR(MachineInstr &MI, MachineBasicBlock *BB,
         .addReg(Elt)
         .addImm(Idx);
 
-    BuildMI(*BB, MI, DL, TII->get(LoongArch::SUBREG_TO_REG), XDst)
+    BuildMI(MBB, It, DL, TII->get(LoongArch::SUBREG_TO_REG), Dst)
         .addReg(ScratchSubReg2)
         .addImm(LoongArch::sub_128);
   } else {
     Register ScratchReg1 = MRI.createVirtualRegister(RC);
     Register ScratchReg2 = MRI.createVirtualRegister(RC);
 
-    BuildMI(*BB, MI, DL, TII->get(BroadcastOp), ScratchReg1).addReg(Elt);
+    BuildMI(MBB, It, DL, TII->get(BroadcastOp), ScratchReg1).addReg(Elt);
 
-    BuildMI(*BB, MI, DL, TII->get(LoongArch::XVPERMI_Q), ScratchReg2)
+    BuildMI(MBB, It, DL, TII->get(LoongArch::XVPERMI_Q), ScratchReg2)
         .addReg(ScratchReg1)
         .addReg(XSrc)
         .addImm(Idx >= HalfSize ? 48 : 18);
 
-    BuildMI(*BB, MI, DL, TII->get(InsOp), XDst)
+    BuildMI(MBB, It, DL, TII->get(InsOp), Dst)
         .addReg(XSrc)
         .addReg(ScratchReg2)
         .addImm((Idx >= HalfSize ? Idx - HalfSize : Idx) * 17);
   }
+}
+
+static MachineBasicBlock *
+emitPseudoXVINSGR2VR(MachineInstr &MI, MachineBasicBlock *BB,
+                     const LoongArchSubtarget &Subtarget) {
+  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
+  MachineRegisterInfo &MRI = BB->getParent()->getRegInfo();
+  // XDst = vector_insert XSrc, Elt, Idx
+  Register XDst = MI.getOperand(0).getReg();
+  Register XSrc = MI.getOperand(1).getReg();
+  Register Elt = MI.getOperand(2).getReg();
+  unsigned Idx = MI.getOperand(3).getImm();
+  unsigned VTEltBytes = MI.getOpcode() == LoongArch::PseudoXVINSGR2VR_B ? 1 : 2;
+  emitXVByteHalfInsert(*BB, MI.getIterator(), MI.getDebugLoc(), TII, MRI, XSrc,
+                       Elt, Idx, VTEltBytes, XDst);
 
   MI.eraseFromParent();
   return BB;
@@ -9343,9 +9367,7 @@ emitPseudoVMSKCOND(MachineInstr &MI, MachineBasicBlock *BB,
   if (NotOpc) {
     Register Tmp = MRI.createVirtualRegister(RC);
     BuildMI(*BB, MI, DL, TII->get(MskOpc), Tmp).addReg(Src);
-    BuildMI(*BB, MI, DL, TII->get(NotOpc), Msk)
-        .addReg(Tmp)
-        .addReg(Tmp);
+    BuildMI(*BB, MI, DL, TII->get(NotOpc), Msk).addReg(Tmp).addReg(Tmp);
   } else {
     BuildMI(*BB, MI, DL, TII->get(MskOpc), Msk).addReg(Src);
   }
@@ -9565,6 +9587,631 @@ emitSelectPseudo(MachineInstr &MI, MachineBasicBlock *BB,
   return TailMBB;
 }
 
+// Masked load/store lowering. LoongArch has no predicated vector memory
+// instructions, but the common runtime case only needs the *active* lanes
+// to be dereferenceable. We exploit that with a page-safety check:
+// when the whole vector stays within one page (the overwhelmingly common
+// case), a full-width vector load/store is safe and we only pay a cheap
+// GPR test plus the blend for the mask; otherwise a per-lane predicated
+// sequence (equivalent to the generic expansion) is used as the cold path.
+//
+// masked load fast path:
+//   t1 = addr + (VecBytes - 1)
+//   safe = ((t1 ^ addr) >> 12) == 0          ; single page?
+//   safe ?  dst = bitsel(mask, vld addr, passthru)
+//        :  per-lane predicated scalar loads
+// masked store fast path (read-modify-write, sound because the mask==0
+// case is skipped first, so a store target is only touched when the
+// original semantics would also have touched it):
+//   if (mask == 0) skip
+//   old = vld addr
+//   vst addr, bitsel(mask, data, old)
+
+SDValue LoongArchTargetLowering::lowerMLOAD(SDValue Op,
+                                            SelectionDAG &DAG) const {
+  auto *N = cast<MaskedLoadSDNode>(Op.getNode());
+  SDLoc dl(Op);
+  EVT VT = N->getValueType(0);
+
+  // Only plain full-width masked loads take the fast path. Extending,
+  // indexed, volatile or atomic masked loads read lanes unconditionally
+  // only via the (safe) per-lane path, so they skip it.
+  bool IsFast = N->getExtensionType() == ISD::NON_EXTLOAD &&
+                N->getAddressingMode() == ISD::UNINDEXED &&
+                N->getMemoryVT() == VT;
+  if (N->isVolatile())
+    IsFast = false;
+
+  unsigned ExtKind = 0;
+  switch (N->getExtensionType()) {
+  case ISD::NON_EXTLOAD:
+    ExtKind = 0;
+    break;
+  case ISD::SEXTLOAD:
+    ExtKind = 1;
+    break;
+  case ISD::ZEXTLOAD:
+  case ISD::EXTLOAD:
+    ExtKind = 2;
+    break;
+  }
+
+  SDValue Addr = N->getBasePtr();
+  SDValue Offset = N->getOffset();
+  if (!Offset.isUndef())
+    Addr = DAG.getNode(ISD::ADD, dl, Addr.getValueType(), {Addr, Offset});
+
+  unsigned Opc = VT.getSizeInBits() == 256 ? LoongArch::PseudoMaskedLoadXV
+                                           : LoongArch::PseudoMaskedLoadV;
+  unsigned MemEltBytes = N->getMemoryVT().getScalarSizeInBits() / 8;
+  unsigned VTEltBytes = VT.getScalarSizeInBits() / 8;
+  // Convention: actual inputs first, chain last (InstrEmitter only skips the
+  // chain operand when it appears at the end). Order matches the td ins:
+  // (mask, addr, passthru, fast, memeltbytes, vtelemtbytes, extkind).
+  SDValue Ops[] = {N->getMask(),
+                   Addr,
+                   N->getPassThru(),
+                   DAG.getTargetConstant(IsFast, dl, MVT::i32),
+                   DAG.getTargetConstant(MemEltBytes, dl, MVT::i32),
+                   DAG.getTargetConstant(VTEltBytes, dl, MVT::i32),
+                   DAG.getTargetConstant(ExtKind, dl, MVT::i32),
+                   N->getChain()};
+  SDNode *Res = DAG.getMachineNode(Opc, dl, {VT, MVT::Other}, Ops);
+  DAG.setNodeMemRefs(cast<MachineSDNode>(Res), {N->getMemOperand()});
+  return DAG.getMergeValues({SDValue(Res, 0), SDValue(Res, 1)}, dl);
+}
+
+SDValue LoongArchTargetLowering::lowerMSTORE(SDValue Op,
+                                             SelectionDAG &DAG) const {
+  auto *N = cast<MaskedStoreSDNode>(Op.getNode());
+  SDLoc dl(Op);
+  EVT VT = N->getValue().getValueType();
+
+  bool IsFast = N->getAddressingMode() == ISD::UNINDEXED &&
+                N->getMemoryVT() == VT && !N->isTruncatingStore();
+  if (N->isVolatile())
+    IsFast = false;
+
+  SDValue Addr = N->getBasePtr();
+  SDValue Offset = N->getOffset();
+  if (!Offset.isUndef())
+    Addr = DAG.getNode(ISD::ADD, dl, Addr.getValueType(), {Addr, Offset});
+
+  unsigned Opc = VT.getSizeInBits() == 256 ? LoongArch::PseudoMaskedStoreXV
+                                           : LoongArch::PseudoMaskedStoreV;
+  unsigned MemEltBytes = N->getMemoryVT().getScalarSizeInBits() / 8;
+  unsigned VTEltBytes = VT.getScalarSizeInBits() / 8;
+  SDValue Ops[] = {N->getValue(),
+                   N->getMask(),
+                   Addr,
+                   DAG.getTargetConstant(IsFast, dl, MVT::i32),
+                   DAG.getTargetConstant(MemEltBytes, dl, MVT::i32),
+                   DAG.getTargetConstant(VTEltBytes, dl, MVT::i32),
+                   DAG.getTargetConstant(0, dl, MVT::i32),
+                   N->getChain()};
+  SDNode *Res = DAG.getMachineNode(Opc, dl, MVT::Other, Ops);
+  DAG.setNodeMemRefs(cast<MachineSDNode>(Res), {N->getMemOperand()});
+  return SDValue(Res, 0);
+}
+
+// Pack a -1/0 boolean vector mask into the low bits of a GPR, one bit per
+// lane (vmskltz extracts the sign bit; -1 lanes set the bit). Mirrors
+// emitPseudoVMSKCOND.
+void LoongArchTargetLowering::emitVectorMaskToGPR(
+    MachineInstr &MI, MachineBasicBlock *MBB, Register Mask,
+    const TargetRegisterClass *RC, unsigned NumElts, unsigned EltBits,
+    Register DstGPR) const {
+  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
+  const LoongArchRegisterInfo *TRI = Subtarget.getRegisterInfo();
+  MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  bool IsXV = TRI->getRegSizeInBits(*RC) > 128;
+
+  unsigned MskOpc;
+  switch (EltBits) {
+  default:
+    llvm_unreachable("unexpected mask element size");
+  case 8:
+    MskOpc = IsXV ? LoongArch::XVMSKLTZ_B : LoongArch::VMSKLTZ_B;
+    break;
+  case 16:
+    MskOpc = IsXV ? LoongArch::XVMSKLTZ_H : LoongArch::VMSKLTZ_H;
+    break;
+  case 32:
+    MskOpc = IsXV ? LoongArch::XVMSKLTZ_W : LoongArch::VMSKLTZ_W;
+    break;
+  case 64:
+    MskOpc = IsXV ? LoongArch::XVMSKLTZ_D : LoongArch::VMSKLTZ_D;
+    break;
+  }
+  Register MskV = MRI.createVirtualRegister(RC);
+  BuildMI(*MBB, MBB->end(), DL, TII->get(MskOpc), MskV).addReg(Mask);
+
+  if (IsXV) {
+    Register Lo = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    Register Hi = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    BuildMI(*MBB, MBB->end(), DL, TII->get(LoongArch::XVPICKVE2GR_WU), Lo)
+        .addReg(MskV)
+        .addImm(0);
+    BuildMI(*MBB, MBB->end(), DL, TII->get(LoongArch::XVPICKVE2GR_WU), Hi)
+        .addReg(MskV)
+        .addImm(4);
+    BuildMI(*MBB, MBB->end(), DL,
+            TII->get(Subtarget.is64Bit() ? LoongArch::BSTRINS_D
+                                         : LoongArch::BSTRINS_W),
+            DstGPR)
+        .addReg(Lo)
+        .addReg(Hi)
+        .addImm(NumElts - 1)
+        .addImm(NumElts / 2);
+  } else {
+    BuildMI(*MBB, MBB->end(), DL, TII->get(LoongArch::VPICKVE2GR_HU), DstGPR)
+        .addReg(MskV)
+        .addImm(0);
+  }
+}
+
+// Expand PseudoMaskedLoad{V,XV} into the diamond:
+//     HeadMBB  (page-safety check, when fast path is enabled)
+//     |  \
+//     |  FastCheckMBB  skip to the tail when no lane is active (the probe
+//     |  |             load below must not touch pages the original load
+//     |  |             would not have accessed)
+//     |  FastMBB       full-width load + bitsel blend
+//     | /
+//     SlowMBB...  per-lane predicated scalar loads (one MBB per lane)
+//     |
+//     TailMBB   (PHI merges the paths)
+MachineBasicBlock *
+LoongArchTargetLowering::emitMaskedLoadPseudo(MachineInstr &MI,
+                                              MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
+  MachineFunction &MF = *BB->getParent();
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  const LoongArchRegisterInfo *TRI = Subtarget.getRegisterInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction::iterator I = ++BB->getIterator();
+
+  Register Dst = MI.getOperand(0).getReg();
+  Register Mask = MI.getOperand(1).getReg();
+  Register Addr = MI.getOperand(2).getReg();
+  Register PassThru = MI.getOperand(3).getReg();
+  bool HasFastPath = MI.getOperand(4).getImm();
+  unsigned MemEltBytes = MI.getOperand(5).getImm();
+  unsigned VTEltBytes = MI.getOperand(6).getImm();
+  unsigned ExtKind = MI.getOperand(7).getImm();
+  Register Blended;
+  bool IsXV = MI.getOpcode() == LoongArch::PseudoMaskedLoadXV;
+  const TargetRegisterClass *RC =
+      IsXV ? &LoongArch::LASX256RegClass : &LoongArch::LSX128RegClass;
+  unsigned VecBytes = TRI->getRegSizeInBits(*RC) / 8;
+  unsigned NumElts = VecBytes / VTEltBytes;
+
+  MachineBasicBlock *FastMBB = nullptr;
+  MachineBasicBlock *FastCheckMBB = nullptr;
+  MachineBasicBlock *SlowMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TailMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+  // Create and insert all blocks before building instructions: instructions
+  // built into blocks that are not yet in the function would get their
+  // operands added to the use lists twice on MF.insert().
+  MF.insert(I, SlowMBB);
+
+  // Cold path: per-lane predicated scalar loads, one MBB per lane.
+  Register Init = MRI.createVirtualRegister(RC);
+  BuildMI(*SlowMBB, SlowMBB->end(), DL, TII->get(TargetOpcode::COPY), Init)
+      .addReg(PassThru);
+  Register MaskGPR = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+  emitVectorMaskToGPR(MI, SlowMBB, Mask, RC, NumElts, VTEltBytes * 8, MaskGPR);
+
+  unsigned PickOpc;
+  if (Subtarget.is64Bit())
+    PickOpc = LoongArch::BSTRPICK_D;
+  else
+    PickOpc = LoongArch::BSTRPICK_W;
+  unsigned LdOpc;
+  bool Sext = ExtKind == 1;
+  switch (MemEltBytes) {
+  default:
+    llvm_unreachable("unexpected masked load element size");
+  case 1:
+    LdOpc = Sext ? LoongArch::LD_B : LoongArch::LD_BU;
+    break;
+  case 2:
+    LdOpc = Sext ? LoongArch::LD_H : LoongArch::LD_HU;
+    break;
+  case 4:
+    if (!Subtarget.is64Bit())
+      LdOpc = LoongArch::LD_W;
+    else
+      LdOpc = Sext ? LoongArch::LD_W : LoongArch::LD_WU;
+    break;
+  case 8:
+    LdOpc = LoongArch::LD_D;
+    break;
+  }
+  unsigned InsOpc;
+  switch (VTEltBytes) {
+  default:
+    llvm_unreachable("unexpected masked load lane size");
+  case 1:
+    InsOpc = IsXV ? LoongArch::PseudoXVINSGR2VR_B : LoongArch::VINSGR2VR_B;
+    break;
+  case 2:
+    InsOpc = IsXV ? LoongArch::PseudoXVINSGR2VR_H : LoongArch::VINSGR2VR_H;
+    break;
+  case 4:
+    InsOpc = IsXV ? LoongArch::XVINSGR2VR_W : LoongArch::VINSGR2VR_W;
+    break;
+  case 8:
+    InsOpc = IsXV ? LoongArch::XVINSGR2VR_D : LoongArch::VINSGR2VR_D;
+    break;
+  }
+
+  MachineBasicBlock *TestMBB = SlowMBB;
+  // ChainIn: lane-chain value entering TestMBB (merged by a PHI in every
+  // intermediate Test block, mirroring the IR-level scalarization).
+  Register ChainIn = Init;
+  Register ChainOut, ChainSkip;
+  MachineBasicBlock *DoLast = nullptr, *TestLast = nullptr;
+  for (unsigned Ln = 0; Ln < NumElts; ++Ln) {
+    bool Last = (Ln + 1 == NumElts);
+    MachineBasicBlock *NextTest =
+        Last ? TailMBB : MF.CreateMachineBasicBlock(LLVM_BB);
+    MachineBasicBlock *DoMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, DoMBB);
+    if (!Last)
+      MF.insert(I, NextTest);
+
+    // Test: skip the lane when its mask bit is clear.
+    Register Bit = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    BuildMI(*TestMBB, TestMBB->end(), DL, TII->get(PickOpc), Bit)
+        .addReg(MaskGPR)
+        .addImm(Ln)
+        .addImm(Ln);
+    TestMBB->addSuccessor(NextTest);
+    TestMBB->addSuccessor(DoMBB);
+    BuildMI(*TestMBB, TestMBB->end(), DL, TII->get(LoongArch::BEQ))
+        .addReg(Bit)
+        .addReg(LoongArch::R0)
+        .addMBB(NextTest);
+
+    // Do: predicated scalar load + lane insert.
+    Register Val = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    MachineInstr *LaneLoad =
+        BuildMI(*DoMBB, DoMBB->end(), DL, TII->get(LdOpc), Val)
+            .addReg(Addr)
+            .addImm(Ln * MemEltBytes);
+    if (!MI.memoperands_empty())
+      LaneLoad->setMemRefs(MF, MI.memoperands());
+    Register InsDst;
+    if (IsXV && VTEltBytes <= 2) {
+      // No real XVINSGR2VR_B/H exists; expand the insert inline (the
+      // Pseudo variant would never be expanded in hand-built MIR).
+      InsDst = MRI.createVirtualRegister(RC);
+      emitXVByteHalfInsert(*DoMBB, DoMBB->end(), DL, TII, MRI, ChainIn, Val, Ln,
+                           VTEltBytes, InsDst);
+    } else {
+      InsDst = MRI.createVirtualRegister(RC);
+      BuildMI(*DoMBB, DoMBB->end(), DL, TII->get(InsOpc), InsDst)
+          .addReg(ChainIn)
+          .addReg(Val)
+          .addImm(Ln);
+    }
+    DoMBB->addSuccessor(NextTest);
+    BuildMI(*DoMBB, DoMBB->end(), DL, TII->get(LoongArch::PseudoBR))
+        .addMBB(NextTest);
+
+    if (Last) {
+      ChainOut = InsDst;
+      ChainSkip = ChainIn;
+      DoLast = DoMBB;
+      TestLast = TestMBB;
+    } else {
+      // Merge the two possible values entering the next lane's Test block.
+      Register Merged = MRI.createVirtualRegister(RC);
+      BuildMI(*NextTest, NextTest->begin(), DL, TII->get(LoongArch::PHI),
+              Merged)
+          .addReg(ChainIn)
+          .addMBB(TestMBB)
+          .addReg(InsDst)
+          .addMBB(DoMBB);
+      ChainIn = Merged;
+    }
+    TestMBB = NextTest;
+  }
+
+  if (HasFastPath) {
+    FastCheckMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, FastCheckMBB);
+    FastMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, FastMBB);
+  }
+  MF.insert(I, TailMBB);
+
+  // Move the remainder of the block into TailMBB and adopt its successors.
+  // (BB -> SlowMBB is re-added below, after the transfer.)
+  TailMBB->splice(TailMBB->end(), BB, std::next(MI.getIterator()), BB->end());
+  TailMBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  if (HasFastPath) {
+    BB->addSuccessor(FastCheckMBB);
+    BB->addSuccessor(SlowMBB);
+
+    // ((addr + VecBytes - 1) ^ addr) >> 12 == 0  =>  whole vector on one page
+    Register T1 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    Register T2 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    Register T3 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    BuildMI(
+        BB, DL,
+        TII->get(Subtarget.is64Bit() ? LoongArch::ADDI_D : LoongArch::ADDI_W),
+        T1)
+        .addReg(Addr)
+        .addImm(VecBytes - 1);
+    BuildMI(BB, DL, TII->get(LoongArch::XOR), T2).addReg(T1).addReg(Addr);
+    BuildMI(
+        BB, DL,
+        TII->get(Subtarget.is64Bit() ? LoongArch::SRLI_D : LoongArch::SRLI_W),
+        T3)
+        .addReg(T2)
+        .addImm(12);
+    BuildMI(BB, DL, TII->get(LoongArch::BEQ))
+        .addReg(T3)
+        .addReg(LoongArch::R0)
+        .addMBB(FastCheckMBB);
+
+    // Skip the probe load entirely when no lane is active: the original
+    // load would not have touched memory, so the (unmapped) page holding
+    // the inactive lanes may legitimately fault.  When the mask is not
+    // all-zero, at least one active lane is dereferenceable and the
+    // page check above proved the whole vector lives on that same page,
+    // making the full-width probe safe.
+    // The check lives in its own block so the BEQ terminator stays at the
+    // end of its block (analyzeBranch ignores mid-block terminators).
+    Register FMaskGPR = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    emitVectorMaskToGPR(MI, FastCheckMBB, Mask, RC, NumElts, VTEltBytes * 8,
+                        FMaskGPR);
+    FastCheckMBB->addSuccessor(TailMBB);
+    FastCheckMBB->addSuccessor(FastMBB);
+    BuildMI(*FastCheckMBB, FastCheckMBB->end(), DL, TII->get(LoongArch::BEQ))
+        .addReg(FMaskGPR)
+        .addReg(LoongArch::R0)
+        .addMBB(TailMBB);
+
+    // Fast path: full-width load + bitsel (mask ? loaded : passthru).
+    Register Loaded = MRI.createVirtualRegister(RC);
+    unsigned LdVecOpc = IsXV ? LoongArch::XVLD : LoongArch::VLD;
+    MachineInstr *NewLoad =
+        BuildMI(*FastMBB, FastMBB->end(), DL, TII->get(LdVecOpc), Loaded)
+            .addReg(Addr)
+            .addImm(0);
+    if (!MI.memoperands_empty())
+      NewLoad->setMemRefs(MF, MI.memoperands());
+    unsigned BitselOpc = IsXV ? LoongArch::XVBITSEL_V : LoongArch::VBITSEL_V;
+    Blended = MRI.createVirtualRegister(RC);
+    BuildMI(*FastMBB, FastMBB->end(), DL, TII->get(BitselOpc), Blended)
+        .addReg(PassThru)
+        .addReg(Loaded)
+        .addReg(Mask);
+    FastMBB->addSuccessor(TailMBB);
+    BuildMI(*FastMBB, FastMBB->end(), DL, TII->get(LoongArch::PseudoBR))
+        .addMBB(TailMBB);
+  } else {
+    BB->addSuccessor(SlowMBB);
+  }
+
+  // Tail merges the fast-path blend (when present) with the lane chain's
+  // final value; the last lane's Test block skips the last lane and carries
+  // the pre-insert value instead.
+  {
+    MachineInstrBuilder PHI =
+        BuildMI(*TailMBB, TailMBB->begin(), DL, TII->get(LoongArch::PHI), Dst);
+    if (HasFastPath) {
+      PHI.addReg(Blended).addMBB(FastMBB);
+      // The all-inactive skip enters the tail with the passthrough value.
+      PHI.addReg(PassThru).addMBB(FastCheckMBB);
+    }
+    PHI.addReg(ChainOut).addMBB(DoLast);
+    PHI.addReg(ChainSkip).addMBB(TestLast);
+    MF.getProperties().resetNoPHIs();
+  }
+  MI.eraseFromParent();
+  return TailMBB;
+}
+
+// Expand PseudoMaskedStore{V,XV}: page-safety check + all-inactive skip,
+// then read-modify-write with a bitsel blend (fast path; split into a check
+// block and a store block so every terminator stays at the end of its block),
+// or per-lane predicated stores (cold path).
+MachineBasicBlock *
+LoongArchTargetLowering::emitMaskedStorePseudo(MachineInstr &MI,
+                                               MachineBasicBlock *BB) const {
+  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
+  MachineFunction &MF = *BB->getParent();
+  const BasicBlock *LLVM_BB = BB->getBasicBlock();
+  const LoongArchRegisterInfo *TRI = Subtarget.getRegisterInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineFunction::iterator I = ++BB->getIterator();
+
+  Register Data = MI.getOperand(0).getReg();
+  Register Mask = MI.getOperand(1).getReg();
+  Register Addr = MI.getOperand(2).getReg();
+  bool HasFastPath = MI.getOperand(3).getImm();
+  unsigned MemEltBytes = MI.getOperand(4).getImm();
+  unsigned VTEltBytes = MI.getOperand(5).getImm();
+  bool IsXV = MI.getOpcode() == LoongArch::PseudoMaskedStoreXV;
+  const TargetRegisterClass *RC =
+      IsXV ? &LoongArch::LASX256RegClass : &LoongArch::LSX128RegClass;
+  unsigned VecBytes = TRI->getRegSizeInBits(*RC) / 8;
+  unsigned NumElts = VecBytes / VTEltBytes;
+
+  MachineBasicBlock *FastCheckMBB = nullptr;
+  MachineBasicBlock *FastDoMBB = nullptr;
+  MachineBasicBlock *SlowMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+  MachineBasicBlock *TailMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+  MF.insert(I, SlowMBB);
+
+  // Cold path: per-lane predicated stores via vstelm, one MBB per lane.
+  Register MaskGPR = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+  emitVectorMaskToGPR(MI, SlowMBB, Mask, RC, NumElts, VTEltBytes * 8, MaskGPR);
+
+  unsigned PickOpc =
+      Subtarget.is64Bit() ? LoongArch::BSTRPICK_D : LoongArch::BSTRPICK_W;
+  unsigned StElmOpc;
+  switch (MemEltBytes) {
+  default:
+    llvm_unreachable("unexpected masked store element size");
+  case 1:
+    StElmOpc = IsXV ? LoongArch::XVSTELM_B : LoongArch::VSTELM_B;
+    break;
+  case 2:
+    StElmOpc = IsXV ? LoongArch::XVSTELM_H : LoongArch::VSTELM_H;
+    break;
+  case 4:
+    StElmOpc = IsXV ? LoongArch::XVSTELM_W : LoongArch::VSTELM_W;
+    break;
+  case 8:
+    StElmOpc = IsXV ? LoongArch::XVSTELM_D : LoongArch::VSTELM_D;
+    break;
+  }
+
+  MachineBasicBlock *TestMBB = SlowMBB;
+  for (unsigned Ln = 0; Ln < NumElts; ++Ln) {
+    bool Last = (Ln + 1 == NumElts);
+    MachineBasicBlock *NextTest =
+        Last ? TailMBB : MF.CreateMachineBasicBlock(LLVM_BB);
+    MachineBasicBlock *DoMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, DoMBB);
+    if (!Last)
+      MF.insert(I, NextTest);
+
+    // Test: skip the lane when its mask bit is clear.
+    Register Bit = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    BuildMI(*TestMBB, TestMBB->end(), DL, TII->get(PickOpc), Bit)
+        .addReg(MaskGPR)
+        .addImm(Ln)
+        .addImm(Ln);
+    TestMBB->addSuccessor(NextTest);
+    TestMBB->addSuccessor(DoMBB);
+    BuildMI(*TestMBB, TestMBB->end(), DL, TII->get(LoongArch::BEQ))
+        .addReg(Bit)
+        .addReg(LoongArch::R0)
+        .addMBB(NextTest);
+
+    // Do: predicated scalar store (vstelm: vd, rj, byte-offset, lane idx).
+    MachineInstr *LaneStore =
+        BuildMI(*DoMBB, DoMBB->end(), DL, TII->get(StElmOpc))
+            .addReg(Data)
+            .addReg(Addr)
+            .addImm(Ln * VTEltBytes)
+            .addImm(Ln);
+    if (!MI.memoperands_empty())
+      LaneStore->setMemRefs(MF, MI.memoperands());
+    DoMBB->addSuccessor(NextTest);
+    BuildMI(*DoMBB, DoMBB->end(), DL, TII->get(LoongArch::PseudoBR))
+        .addMBB(NextTest);
+
+    TestMBB = NextTest;
+  }
+
+  if (HasFastPath) {
+    FastCheckMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, FastCheckMBB);
+    FastDoMBB = MF.CreateMachineBasicBlock(LLVM_BB);
+    MF.insert(I, FastDoMBB);
+  }
+  MF.insert(I, TailMBB);
+
+  // Move the remainder of the block into TailMBB and adopt its successors.
+  // (BB -> SlowMBB is re-added below, after the transfer.)
+  TailMBB->splice(TailMBB->end(), BB, std::next(MI.getIterator()), BB->end());
+  TailMBB->transferSuccessorsAndUpdatePHIs(BB);
+
+  if (HasFastPath) {
+    BB->addSuccessor(FastCheckMBB);
+    BB->addSuccessor(SlowMBB);
+
+    Register T1 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    Register T2 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    Register T3 = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    BuildMI(
+        BB, DL,
+        TII->get(Subtarget.is64Bit() ? LoongArch::ADDI_D : LoongArch::ADDI_W),
+        T1)
+        .addReg(Addr)
+        .addImm(VecBytes - 1);
+    BuildMI(BB, DL, TII->get(LoongArch::XOR), T2).addReg(T1).addReg(Addr);
+    BuildMI(
+        BB, DL,
+        TII->get(Subtarget.is64Bit() ? LoongArch::SRLI_D : LoongArch::SRLI_W),
+        T3)
+        .addReg(T2)
+        .addImm(12);
+    BuildMI(BB, DL, TII->get(LoongArch::BEQ))
+        .addReg(T3)
+        .addReg(LoongArch::R0)
+        .addMBB(FastCheckMBB);
+
+    // Fast path, split across two blocks so that every terminator sits at
+    // the end of its block: analyzeBranch ignores mid-block terminators, so
+    // a BEQ in the middle of the block would lose its CFG edge to tail
+    // duplication and leave the branch targeting an unlabeled block.
+    //   FastCheckMBB: skip to the tail entirely when no lane is active (this
+    //                 also keeps the read-modify-write below from touching
+    //                 memory the original store would not have touched).
+    //   FastDoMBB:    read-modify-write blended into the old value.
+    Register FMaskGPR = MRI.createVirtualRegister(&LoongArch::GPRRegClass);
+    emitVectorMaskToGPR(MI, FastCheckMBB, Mask, RC, NumElts, VTEltBytes * 8,
+                        FMaskGPR);
+    FastCheckMBB->addSuccessor(TailMBB);
+    FastCheckMBB->addSuccessor(FastDoMBB);
+    BuildMI(*FastCheckMBB, FastCheckMBB->end(), DL, TII->get(LoongArch::BEQ))
+        .addReg(FMaskGPR)
+        .addReg(LoongArch::R0)
+        .addMBB(TailMBB);
+
+    // The original MMO has store semantics; the RMW probe below is a load,
+    // so give it a load-semantics clone.
+    MachineMemOperand *LoadMMO = nullptr;
+    if (!MI.memoperands_empty()) {
+      const MachineMemOperand *StMMO = *MI.memoperands_begin();
+      LoadMMO = MF.getMachineMemOperand(
+          StMMO->getPointerInfo(), MachineMemOperand::MOLoad, StMMO->getSize(),
+          StMMO->getBaseAlign());
+    }
+    Register Old = MRI.createVirtualRegister(RC);
+    unsigned LdVecOpc = IsXV ? LoongArch::XVLD : LoongArch::VLD;
+    MachineInstr *OldLoad =
+        BuildMI(*FastDoMBB, FastDoMBB->end(), DL, TII->get(LdVecOpc), Old)
+            .addReg(Addr)
+            .addImm(0);
+    if (LoadMMO)
+      OldLoad->setMemRefs(MF, LoadMMO);
+    unsigned BitselOpc = IsXV ? LoongArch::XVBITSEL_V : LoongArch::VBITSEL_V;
+    Register Blended = MRI.createVirtualRegister(RC);
+    BuildMI(*FastDoMBB, FastDoMBB->end(), DL, TII->get(BitselOpc), Blended)
+        .addReg(Old)
+        .addReg(Data)
+        .addReg(Mask);
+    unsigned StVecOpc = IsXV ? LoongArch::XVST : LoongArch::VST;
+    MachineInstr *VecStore =
+        BuildMI(*FastDoMBB, FastDoMBB->end(), DL, TII->get(StVecOpc))
+            .addReg(Blended)
+            .addReg(Addr)
+            .addImm(0);
+    if (!MI.memoperands_empty())
+      VecStore->setMemRefs(MF, MI.memoperands());
+    FastDoMBB->addSuccessor(TailMBB);
+    BuildMI(*FastDoMBB, FastDoMBB->end(), DL, TII->get(LoongArch::PseudoBR))
+        .addMBB(TailMBB);
+  } else {
+    BB->addSuccessor(SlowMBB);
+  }
+  MI.eraseFromParent();
+  return TailMBB;
+}
+
 MachineBasicBlock *LoongArchTargetLowering::EmitInstrWithCustomInserter(
     MachineInstr &MI, MachineBasicBlock *BB) const {
   const TargetInstrInfo *TII = Subtarget.getInstrInfo();
@@ -9573,6 +10220,12 @@ MachineBasicBlock *LoongArchTargetLowering::EmitInstrWithCustomInserter(
   switch (MI.getOpcode()) {
   default:
     llvm_unreachable("Unexpected instr type to insert");
+  case LoongArch::PseudoMaskedLoadV:
+  case LoongArch::PseudoMaskedLoadXV:
+    return emitMaskedLoadPseudo(MI, BB);
+  case LoongArch::PseudoMaskedStoreV:
+  case LoongArch::PseudoMaskedStoreXV:
+    return emitMaskedStorePseudo(MI, BB);
   case LoongArch::DIV_W:
   case LoongArch::DIV_WU:
   case LoongArch::MOD_W:

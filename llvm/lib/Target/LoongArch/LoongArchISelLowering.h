@@ -224,6 +224,16 @@ private:
   MachineBasicBlock *
   EmitInstrWithCustomInserter(MachineInstr &MI,
                               MachineBasicBlock *BB) const override;
+  SDValue lowerMLOAD(SDValue Op, SelectionDAG &DAG) const;
+  SDValue lowerMSTORE(SDValue Op, SelectionDAG &DAG) const;
+  MachineBasicBlock *emitMaskedLoadPseudo(MachineInstr &MI,
+                                          MachineBasicBlock *BB) const;
+  MachineBasicBlock *emitMaskedStorePseudo(MachineInstr &MI,
+                                           MachineBasicBlock *BB) const;
+  void emitVectorMaskToGPR(MachineInstr &MI, MachineBasicBlock *MBB,
+                           Register Mask, const TargetRegisterClass *RC,
+                           unsigned NumElts, unsigned EltBits,
+                           Register DstGPR) const;
   SDValue lowerATOMIC_FENCE(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerEH_DWARF_CFA(SDValue Op, SelectionDAG &DAG) const;

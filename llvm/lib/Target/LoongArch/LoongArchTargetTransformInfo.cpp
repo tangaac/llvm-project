@@ -113,6 +113,62 @@ bool LoongArchTTIImpl::shouldExpandReduction(const IntrinsicInst *II) const {
   }
 }
 
+// Masked load/store are supported for all legal fixed-width vector types:
+// the backend lowers them into a page-safety check + full-width vector
+// access + bitsel blend (fast path) or a per-lane predicated sequence
+// (cold path). Claiming legality lets the loop vectorizer widen
+// conditionally-executed accesses and if-converted stores instead of
+// leaving such loops scalar.
+static bool isLegalMaskedMemOp(Type *ScalarTy) {
+  if (ScalarTy->isPointerTy())
+    return true;
+  if (IntegerType *IntTy = dyn_cast<IntegerType>(ScalarTy))
+    return llvm::isPowerOf2_32(IntTy->getBitWidth()) &&
+           IntTy->getBitWidth() >= 8 && IntTy->getBitWidth() <= 64;
+  return ScalarTy->isFloatTy() || ScalarTy->isDoubleTy();
+}
+
+// The loop vectorizer queries with the scalar type; the
+// ScalarizeMaskedMemIntrin pass queries with the vector type. Accept both.
+static bool isLegalMaskedMemOpTy(Type *Ty) {
+  if (auto *VecTy = dyn_cast<VectorType>(Ty))
+    return !VecTy->isScalableTy() &&
+           isLegalMaskedMemOp(VecTy->getElementType());
+  return isLegalMaskedMemOp(Ty);
+}
+
+bool LoongArchTTIImpl::isLegalMaskedLoad(Type *DataType, Align Alignment,
+                                         unsigned AddressSpace,
+                                         TTI::MaskKind MaskKind) const {
+  return ST->hasExtLSX() && isLegalMaskedMemOpTy(DataType);
+}
+
+bool LoongArchTTIImpl::isLegalMaskedStore(Type *DataType, Align Alignment,
+                                          unsigned AddressSpace,
+                                          TTI::MaskKind MaskKind) const {
+  return ST->hasExtLSX() && isLegalMaskedMemOpTy(DataType);
+}
+
+InstructionCost LoongArchTTIImpl::getMemIntrinsicInstrCost(
+    const MemIntrinsicCostAttributes &MICA,
+    TTI::TargetCostKind CostKind) const {
+  // Masked load/store lowering instruction counts (see
+  // LoongArchISelLowering.cpp emitMaskedLoadPseudo/emitMaskedStorePseudo):
+  //   load:  add/xor/srli + branch + vld + bitsel           ~ 4
+  //   store: add/xor/srli + branch + vld + bitsel + vst     ~ 5
+  // This keeps masked widening cheaper than scalarizing (which costs O(VF)
+  // predicated scalar accesses) while still more expensive than an
+  // unconditional vector access.
+  switch (MICA.getID()) {
+  case Intrinsic::masked_load:
+    return InstructionCost(4);
+  case Intrinsic::masked_store:
+    return InstructionCost(5);
+  default:
+    return BaseT::getMemIntrinsicInstrCost(MICA, CostKind);
+  }
+}
+
 LoongArchTTIImpl::TTI::MemCmpExpansionOptions
 LoongArchTTIImpl::enableMemCmpExpansion(bool OptSize, bool IsZeroCmp) const {
   TTI::MemCmpExpansionOptions Options;
